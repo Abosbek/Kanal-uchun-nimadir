@@ -143,7 +143,7 @@ async def cmd_start(message: Message):
         return
 
     text = (
-        "👋 <b>Telegram Channel Manager AI</b> botiga xush kelibsiz!\n\n"
+        "👋 <b>Telegram Channel Manager AI</b> botiga xush kelibsiz\n\n"
         "Quyidagilardan birini yuboring:\n"
         "• 🔗 Havola (link) — maqolani o'qib, post tayyorlayman\n"
         "• 📦 .apk fayl — ilova haqida post tayyorlayman\n"
