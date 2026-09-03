@@ -1,4 +1,4 @@
-"""
+Enter"""
 ai_service.py
 Google Gemini (google-genai) orqali matn generatsiyasi, web-sahifa scraping,
 APK fayl tahlili va RSS feed'larni o'qish uchun xizmatlar.
@@ -119,6 +119,41 @@ async def rewrite_post(original_text: str, style_hint: Optional[str] = None) -> 
         f"{original_text}"
     )
     return await _generate(prompt, temperature=1.0)
+
+
+# ---------------------------------------------------------------------------
+# "Maqola" (Rich Message) uchun to'liq formatlangan Markdown yaratish
+# ---------------------------------------------------------------------------
+
+RICH_STYLE_PROMPT = (
+    "Sen professional texnologiya jurnalistisan. Quyidagi post matnini "
+    "to'liq formatlangan, jozibali 'maqola' ko'rinishiga keltirib qayta yoz. "
+    "Telegram Markdown formatlashdan foydalan:\n"
+    "- Sarlavha uchun # belgisidan foydalan (bitta sarlavha, boshida)\n"
+    "- Eng muhim so'z/ibora yoki raqamlarni **qalin** qil (kamida 2-3 marta)\n"
+    "- Urg'u berish kerak bo'lgan joylarni _kursiv_ qil\n"
+    "- Matn ichidan eng muhim, diqqatga sazovor bitta gapni > belgisi bilan "
+    "iqtibos (blockquote) sifatida ajrat\n"
+    "- Agar matnda taqqoslash mumkin bo'lgan ma'lumotlar (masalan versiyalar, "
+    "narxlar, xususiyatlar) bo'lsa, ularni Markdown jadval (| ustun | ustun |) "
+    "ko'rinishida ber. Agar mos ma'lumot bo'lmasa, jadval qo'shma.\n"
+    "- Oxirida hashteglarni saqlab qol.\n"
+    "MUHIM: mazmunni o'zgartirma, faqat formatlashni boyit. Faqat tayyor "
+    "Markdown matnini qaytar, boshqa izoh yozma."
+)
+
+
+async def enrich_content_for_rich_post(plain_content: str) -> str:
+    """
+    Oddiy post matnini Telegram Rich Message (Bot API 10.1+, sendRichMessage)
+    uchun to'liq formatlangan (qalin, kursiv, iqtibos, jadval) Markdown'ga aylantiradi.
+    """
+    prompt = f"{RICH_STYLE_PROMPT}\n\nPost matni:\n\n{plain_content}"
+    try:
+        return await _generate(prompt, temperature=0.6)
+    except Exception as e:
+        logger.warning("Rich formatlashda xatolik, oddiy matn ishlatiladi: %s", e)
+        return plain_content
 
 
 async def generate_post_from_apk(apk_info: dict, caption: Optional[str] = None) -> str:
