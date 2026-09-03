@@ -38,7 +38,7 @@ def _get_client() -> genai.Client:
 
 BASE_STYLE_PROMPT = (
     "Sen o'zbek tilidagi Telegram texnologiya kanali uchun kontent yozuvchisan. "
-    "Uslubing: qisqa, jonli, chiroyli emoji bilan bezatilgan, aniq va professional. "
+    "Uslubing:batafsil jonli, chiroyli emoji bilan bezatilgan ammo juda ko‘p emoji han bo‘lmasin, aniq va professional. "
     "Post oxirida mavzuga mos 3-5 ta hashteg qo'sh. "
     "MUHIM: hech qanday Markdown belgisidan foydalanma — ya'ni **qalin**, __tagizza__, "
     "# sarlavha yoki shunga o'xshash belgilarni ishlatma. Faqat oddiy matn va emoji ishlat. "
