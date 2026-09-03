@@ -1,4 +1,4 @@
-Enter"""
+"""
 ai_service.py
 Google Gemini (google-genai) orqali matn generatsiyasi, web-sahifa scraping,
 APK fayl tahlili va RSS feed'larni o'qish uchun xizmatlar.
@@ -46,11 +46,11 @@ BASE_STYLE_PROMPT = (
 )
 
 
-async def _generate(prompt: str, temperature: float = 0.8, max_retries: int = 3) -> str:
+async def _generate(prompt: str, temperature: float = 0.8, max_retries: int = 4) -> str:
     """
     Gemini API'ga so'rov yuborish (blocking chaqiruvni thread'da bajaramiz).
     Google tomonidan vaqtinchalik xatolar (503 UNAVAILABLE, 429 RATE_LIMIT) qaytarilsa,
-    eksponensial kutish bilan avtomatik qayta urinadi.
+    eksponensial kutish bilan avtomatik qayta urinadi (jami ~30 soniyagacha).
     """
 
     def _call() -> str:
@@ -74,7 +74,7 @@ async def _generate(prompt: str, temperature: float = 0.8, max_retries: int = 3)
                 for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
             )
             if is_temporary and attempt < max_retries:
-                wait_seconds = 2 ** attempt  # 2s, 4s, 8s...
+                wait_seconds = min(2 ** attempt, 15)  # 2s, 4s, 8s, 15s...
                 logger.warning(
                     "Gemini vaqtinchalik band (urinish %s/%s), %s soniyadan keyin qayta urinamiz: %s",
                     attempt, max_retries, wait_seconds, e,
