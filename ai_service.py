@@ -1,4 +1,3 @@
-
 """
 ai_service.py
 Google Gemini (google-genai) orqali matn generatsiyasi, web-sahifa scraping,
@@ -8,9 +7,11 @@ APK fayl tahlili va RSS feed'larni o'qish uchun xizmatlar.
 import asyncio
 import logging
 import os
+import random
 import re
 import zipfile
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 import feedparser
@@ -278,3 +279,145 @@ async def generate_post_from_rss_item(item: RssItem) -> str:
         f"Manba: {item.link}"
     )
     return await _generate(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Rasm qidiruvi uchun optimallashtirilgan (ingliz tilida) kalit so'z yaratish
+# ---------------------------------------------------------------------------
+
+async def generate_image_search_query(post_content: str) -> str:
+    """
+    Rasm qidiruv tizimlari (Google/Bing/DuckDuckGo) odatda ingliz tilidagi qisqa
+    so'zlarga yaxshiroq javob beradi. Shuning uchun o'zbekcha post matnidan
+    3-5 so'zdan iborat, vizual jihatdan aniq ingliz qidiruv so'zini yasaymiz.
+    """
+    prompt = (
+        "Quyidagi post matni asosida, rasm qidiruv tizimi uchun 3-5 so'zdan iborat, "
+        "aniq va vizual jihatdan tasvirlanadigan INGLIZ TILIDA qidiruv so'zini yoz. "
+        "Faqat qidiruv so'zini qaytar, boshqa hech narsa yozma, tirnoq belgisiz:\n\n"
+        f"{post_content[:500]}"
+    )
+    try:
+        result = await _generate(prompt, temperature=0.3)
+        return result.strip().strip('"').strip("'")
+    except Exception as e:
+        logger.warning("Qidiruv so'zi generatsiyasida xatolik, xom matn ishlatiladi: %s", e)
+        return post_content[:60]
+
+
+# ---------------------------------------------------------------------------
+# Har kuni avtomatik post generatsiyasi uchun mavzular hovuzi
+# ---------------------------------------------------------------------------
+
+TOPIC_POOL = [
+    "Sun'iy intellekt sohasidagi eng so'nggi startaplar",
+    "Foydali va kam odam biladigan Chrome kengaytmalari",
+    "Dasturchilar uchun hayotni osonlashtiruvchi lifehacklar",
+    "Kiberxavfsizlik bo'yicha amaliy maslahatlar",
+    "Hozir juda mashhur bo‘layotgan ai orqali o‘zini rasmini har xil rasmga aylantirish uchun promplar ",
+    "Qiziqarli va foydali veb-saytlar to'plami",
+    "Ochiq manbali (open-source) loyihalarning eng qizig'lari",
+    "Robototexnika sohasidagi so'nggi yutuqlar",
+    "Kvant kompyuterlar haqida sodda tilda",
+    "Mobil ilovalar dunyosidagi eng qiziqarli yangiliklar",
+    "Googledagi qiziqarli natija beradigan qidiruv so‘zlari yangilari",
+    "Kosmik texnologiyalar va xususiy kosmik kompaniyalar",
+    "Virtual va kengaytirilgan reallik (VR/AR) yangiliklari",
+    "Elektromobillar sohasidagi so'nggi yangiliklar",
+    "Gadjetlar olamidan qiziqarli faktlar",
+    "Dasturlash tillari reytingi va tendensiyalari",
+    "Blokcheyn va kriptovalyutalar dunyosidagi yangiliklar",
+    "IT sohasida martaba qurish bo'yicha maslahatlar",
+    "Foydali AI vositalari (ChatGPT, Midjourney va boshqalar)",
+    "Internet xavfsizligi va shaxsiy ma'lumotlarni himoya qilish",
+    "Video o'yinlar sanoatidagi so'nggi yangiliklar",
+    "Ijtimoiy tarmoqlar algoritmlari qanday ishlaydi",
+    "Big Data va ma'lumotlar tahlili dunyosi",
+    "Texnologik gigantlarning (Google, Apple, Microsoft) so'nggi qadamlari",
+    "Startap ekotizimi va venchur investitsiyalar",
+    "Smart uy (Smart Home) texnologiyalari",
+    "5G va kelajakdagi aloqa texnologiyalari",
+    "Ta'limda texnologiyalar (EdTech) yangiliklari",
+    "Sog'liqni saqlashda sun'iy intellekt qo'llanilishi",
+    "Iqtisodiyot va texnologiya kesishmasidagi qiziqarli voqealar",
+]
+
+
+def get_daily_ai_topics(count: int = 5, seed_date: Optional[date] = None) -> list[str]:
+    """
+    Har kuni boshqacha, lekin bir kun ichida barqaror (deterministik) mavzular
+    to'plamini qaytaradi — shu sababli qayta ishga tushirilsa ham bir xil kun
+    uchun bir xil mavzular tanlanadi, lekin har kuni boshqa kombinatsiya chiqadi.
+    """
+    seed_date = seed_date or date.today()
+    rng = random.Random(seed_date.isoformat())
+    pool_copy = TOPIC_POOL.copy()
+    rng.shuffle(pool_copy)
+    return pool_copy[:count]
+
+
+# ---------------------------------------------------------------------------
+# Har kuni bir nechta RSS manbadan eng so'nggi yangiliklarni yig'ish
+# ---------------------------------------------------------------------------
+
+DAILY_RSS_SOURCES = [
+    os.getenv("PRODUCTHUNT_RSS", "https://www.producthunt.com/feed"),
+    os.getenv("REDDIT_RSS", "https://www.reddit.com/r/technology/.rss"),
+    "https://hnrss.org/frontpage",
+]
+
+
+async def get_daily_news_items(count: int = 5) -> list[RssItem]:
+    """Bir nechta RSS manbadan yangiliklarni yig'ib, birlashtirib, top N tasini qaytaradi."""
+    all_items: list[RssItem] = []
+    per_source_limit = max(2, (count // max(1, len(DAILY_RSS_SOURCES))) + 2)
+
+    for feed_url in DAILY_RSS_SOURCES:
+        items = await fetch_rss_items(feed_url, limit=per_source_limit)
+        all_items.extend(items)
+
+    # Sarlavha bo'yicha takrorlanishlarni olib tashlaymiz
+    seen_titles = set()
+    unique_items = []
+    for item in all_items:
+        key = item.title.strip().lower()
+        if key and key not in seen_titles:
+            seen_titles.add(key)
+            unique_items.append(item)
+
+    random.shuffle(unique_items)
+    return unique_items[:count]
+
+
+# ---------------------------------------------------------------------------
+# Maqola sahifasidan asosiy rasmni (og:image) topish
+# ---------------------------------------------------------------------------
+
+def _fetch_og_image_sync(url: str, timeout: int = 15) -> Optional[str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning("og:image uchun sahifani ochib bo'lmadi (%s): %s", url, e)
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "twitter:image"})
+    if og_image and og_image.get("content"):
+        return og_image["content"]
+    return None
+
+
+async def fetch_og_image(url: str) -> Optional[str]:
+    """Maqola/havola sahifasidan asosiy (og:image) rasm URL manzilini qaytaradi, topilmasa None."""
+    try:
+        return await asyncio.to_thread(_fetch_og_image_sync, url)
+    except Exception as e:
+        logger.warning("og:image olishda xatolik: %s", e)
+        return None
