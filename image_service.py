@@ -8,12 +8,14 @@ import asyncio
 import io
 import logging
 import os
+import time
 import urllib.parse
 from typing import Optional
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from duckduckgo_search import DDGS
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 
 logger = logging.getLogger(__name__)
 
@@ -66,29 +68,48 @@ def get_ai_image_url(prompt: str, width: int = 1024, height: int = 768) -> str:
 
 async def search_real_image(query: str, max_results: int = 5) -> Optional[str]:
     """
-    DuckDuckGo orqali mavzuga oid rasm URL manzilini qaytaradi.
-    Bir nechta natija ichidan birinchisini tanlaydi.
+    DuckDuckGo (ddgs kutubxonasi) orqali mavzuga oid rasm URL manzilini qaytaradi.
+    Bir nechta natija ichidan birinchisini tanlaydi. Rate-limitga uchraganda
+    qisqa kutish bilan bir necha marta qayta urinadi.
     """
 
     def _search() -> Optional[str]:
-        try:
-            with DDGS() as ddgs:
-                results = list(
-                    ddgs.images(
-                        keywords=query,
-                        region="wt-wt",
-                        safesearch="moderate",
-                        max_results=max_results,
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                with DDGS() as ddgs:
+                    results = list(
+                        ddgs.images(
+                            query=query,
+                            region="wt-wt",
+                            safesearch="moderate",
+                            max_results=max_results,
+                        )
                     )
-                )
-            for r in results:
-                image_url = r.get("image")
-                if image_url:
-                    return image_url
-            return None
-        except Exception as e:
-            logger.exception("DuckDuckGo rasm qidirishda xatolik: %s", e)
-            return None
+                for r in results:
+                    image_url = r.get("image") or r.get("image_url") or r.get("url")
+                    if image_url:
+                        return image_url
+                return None
+            except RatelimitException as e:
+                last_error = e
+                logger.warning("DuckDuckGo rate-limit, qayta urinish %s/3...", attempt + 1)
+                time.sleep(2 * (attempt + 1))
+            except TimeoutException as e:
+                last_error = e
+                logger.warning("DuckDuckGo timeout, qayta urinish %s/3...", attempt + 1)
+                time.sleep(1)
+            except DDGSException as e:
+                last_error = e
+                logger.exception("DuckDuckGo qidiruvida xatolik: %s", e)
+                break
+            except Exception as e:
+                last_error = e
+                logger.exception("Kutilmagan xatolik rasm qidirishda: %s", e)
+                break
+        if last_error:
+            logger.warning("Rasm qidiruvi muvaffaqiyatsiz yakunlandi: %s", last_error)
+        return None
 
     return await asyncio.to_thread(_search)
 
