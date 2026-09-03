@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from typing import Optional
 
@@ -49,6 +50,10 @@ CHANNEL_FOOTER = os.getenv(
 
 URL_REGEX = re.compile(r"https?://\S+")
 
+# Admin qaysi vaqt zonasida yashashini ko'rsatadi (rejalashtirish uchun).
+# Toshkent vaqti standart bo'yicha UTC+5.
+ADMIN_TZ_OFFSET_HOURS = int(os.getenv("ADMIN_TIMEZONE_OFFSET_HOURS", "5"))
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -77,6 +82,10 @@ class EditPost(StatesGroup):
     waiting_for_new_text = State()
 
 
+class SchedulePost(StatesGroup):
+    waiting_for_datetime = State()
+
+
 # ---------------------------------------------------------------------------
 # Yordamchi: klaviaturalar
 # ---------------------------------------------------------------------------
@@ -93,13 +102,14 @@ def build_image_choice_keyboard(post_id: int) -> InlineKeyboardMarkup:
 def build_moderation_keyboard(post_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Kanalga e'lon qilish", callback_data=f"post:publish:{post_id}")
+    builder.button(text="🕒 Rejalashtirish", callback_data=f"post:schedule:{post_id}")
     builder.button(text="📰 Maqola sifatida", callback_data=f"post:richpost:{post_id}")
     builder.button(text="🔄 Qayta yozish", callback_data=f"post:rewrite:{post_id}")
     builder.button(text="🖼 AI Rasm", callback_data=f"post:ai_image:{post_id}")
     builder.button(text="🔍 Google Rasm", callback_data=f"post:real_image:{post_id}")
     builder.button(text="✏️ Tahrirlash", callback_data=f"post:edit:{post_id}")
     builder.button(text="🗑 O'chirish", callback_data=f"post:delete:{post_id}")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 1, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -154,12 +164,29 @@ async def _start_post_flow(
     content: str,
     source_type: str,
     source_ref: Optional[str] = None,
+    attachment_file_id: Optional[str] = None,
 ):
     """Generatsiya qilingan matnni bazaga yozib, rasm tanlash klaviaturasini yuboradi."""
     try:
-        post = await db.create_post(content=content, source_type=source_type, source_ref=source_ref)
+        post = await db.create_post(
+            content=content,
+            source_type=source_type,
+            source_ref=source_ref,
+            attachment_file_id=attachment_file_id,
+        )
     except Exception as e:
         await message.answer(f"❌ Bazaga yozishda xatolik: {e}")
+        return
+
+    # Agar .apk (yoki boshqa hujjat) biriktirilgan bo'lsa, rasm so'ralmaydi —
+    # to'g'ridan-to'g'ri moderatsiya paneli ko'rsatiladi (fayl allaqachon Telegram serverida saqlanadi).
+    if attachment_file_id:
+        sent = await message.answer(
+            f"📝 <b>Qoralama tayyor (.apk fayl bilan):</b>\n\n{format_for_telegram_html(content)}",
+            parse_mode="HTML",
+        )
+        await db.set_admin_message(post.id, sent.chat.id, sent.message_id)
+        await _render_moderation_panel(message, db, post.id)
         return
 
     sent = await message.answer(
@@ -236,7 +263,8 @@ async def handle_text_message(message: Message, db: Database):
 
 
 # ---------------------------------------------------------------------------
-# 3) .apk fayl yuborilganda
+# 3) .apk fayl yuborilganda (fayl yuklab olinmaydi — Telegram file_id orqali
+#    to'g'ridan-to'g'ri kanalga yo'naltiriladi, faqat matn AI orqali yaratiladi)
 # ---------------------------------------------------------------------------
 
 @router.message(F.document.file_name.endswith(".apk"))
@@ -244,27 +272,38 @@ async def handle_apk_document(message: Message, db: Database, bot: Bot):
     if not is_admin(message.from_user.id):
         return
 
-    status_msg = await message.answer("📦 APK fayl tahlil qilinmoqda...")
+    status_msg = await message.answer("📦 APK fayl ma'lumotlari asosida post tayyorlanmoqda...")
 
-    tmp_path = None
+    document = message.document
+    apk_info = {
+        "Fayl nomi": document.file_name,
+        "Hajmi": image_service_human_size(document.file_size) if document.file_size else "Noma'lum",
+    }
+    caption = message.caption  # Admin yuborgan izoh — ilova nomi, tavsifi va h.k. shu yerdan olinadi
+
     try:
-        file_info = await bot.get_file(message.document.file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".apk") as tmp:
-            tmp_path = tmp.name
-        await bot.download_file(file_info.file_path, destination=tmp_path)
-
-        apk_info = ai_service.extract_apk_info(tmp_path)
-        caption = message.caption
         content = await ai_service.generate_post_from_apk(apk_info, caption=caption)
     except Exception as e:
-        await status_msg.edit_text(f"❌ APK faylni qayta ishlashda xatolik: {e}")
+        await status_msg.edit_text(f"❌ Post yaratishda xatolik: {e}")
         return
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
     await status_msg.delete()
-    await _start_post_flow(message, db, content, source_type="apk", source_ref=message.document.file_name)
+    await _start_post_flow(
+        message,
+        db,
+        content,
+        source_type="apk",
+        source_ref=document.file_name,
+        attachment_file_id=document.file_id,
+    )
+
+
+def image_service_human_size(size_bytes: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +366,8 @@ async def handle_image_choice(callback: CallbackQuery, db: Database):
             image_bytes = await image_service.generate_ai_image(prompt_seed)
             image_source = ImageSourceType.AI_GENERATED
         elif choice == "real":
-            image_url = await image_service.search_real_image(prompt_seed)
+            search_query = await ai_service.generate_image_search_query(prompt_seed)
+            image_url = await image_service.search_real_image(search_query)
             if not image_url:
                 raise RuntimeError("Mos rasm topilmadi.")
             image_bytes = await image_service.download_image_bytes(image_url)
@@ -401,8 +441,19 @@ async def handle_moderation_action(callback: CallbackQuery, db: Database, bot: B
         await _publish_post(callback, db, bot, post_id)
 
     elif action == "richpost":
-        await callback.answer("📰 Maqola sifatida chop etilmoqda...")
+        await callback.answer("📰 AI maqola shaklida formatlanmoqda...")
         await _publish_rich_post(callback, db, bot, post_id)
+
+    elif action == "schedule":
+        await callback.answer()
+        await state.update_data(schedule_post_id=post_id)
+        await state.set_state(SchedulePost.waiting_for_datetime)
+        await callback.message.answer(
+            "🕒 Chop etish sanasi va vaqtini quyidagi formatda yuboring "
+            "(Toshkent vaqti bo'yicha):\n\n<code>31.12.2026 18:30</code>\n\n"
+            "Bekor qilish uchun /cancel yozing.",
+            parse_mode="HTML",
+        )
 
     elif action == "rewrite":
         await callback.answer("🔄 Qayta yozilmoqda...")
@@ -454,7 +505,8 @@ async def _regenerate_image(callback: CallbackQuery, db: Database, post_id: int,
             image_bytes = await image_service.generate_ai_image(prompt_seed)
             image_source = ImageSourceType.AI_GENERATED
         else:
-            image_url = await image_service.search_real_image(prompt_seed)
+            search_query = await ai_service.generate_image_search_query(prompt_seed)
+            image_url = await image_service.search_real_image(search_query)
             if not image_url:
                 raise RuntimeError("Mos rasm topilmadi.")
             image_bytes = await image_service.download_image_bytes(image_url)
@@ -495,6 +547,55 @@ async def cancel_edit(message: Message, state: FSMContext):
     await message.answer("❌ Tahrirlash bekor qilindi.")
 
 
+@router.message(Command("cancel"), SchedulePost.waiting_for_datetime)
+async def cancel_schedule(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Rejalashtirish bekor qilindi.")
+
+
+@router.message(SchedulePost.waiting_for_datetime)
+async def process_schedule_datetime(message: Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    post_id = data.get("schedule_post_id")
+
+    if not post_id:
+        await state.clear()
+        await message.answer("⚠️ Post ID topilmadi, qaytadan urinib ko'ring.")
+        return
+
+    text = message.text.strip()
+    try:
+        local_dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.answer(
+            "❌ Format noto'g'ri. Iltimos, aynan shunday yozing:\n<code>31.12.2026 18:30</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Admin mahalliy vaqtini (Toshkent, standart UTC+5) UTC'ga aylantiramiz
+    admin_tz = timezone(timedelta(hours=ADMIN_TZ_OFFSET_HOURS))
+    local_dt = local_dt.replace(tzinfo=admin_tz)
+    utc_dt = local_dt.astimezone(timezone.utc)
+
+    if utc_dt <= datetime.now(timezone.utc):
+        await message.answer("❌ Kiritilgan vaqt allaqachon o'tib ketgan. Kelajakdagi vaqtni kiriting.")
+        return
+
+    await state.clear()
+
+    try:
+        await db.schedule_post(post_id, utc_dt)
+    except Exception as e:
+        await message.answer(f"❌ Rejalashtirishda xatolik: {e}")
+        return
+
+    await message.answer(
+        f"✅ Post rejalashtirildi!\n🕒 Chop etish vaqti: <b>{text}</b> (Toshkent vaqti)",
+        parse_mode="HTML",
+    )
+
+
 @router.message(EditPost.waiting_for_new_text)
 async def process_edit_text(message: Message, state: FSMContext, db: Database):
     data = await state.get_data()
@@ -519,20 +620,38 @@ async def process_edit_text(message: Message, state: FSMContext, db: Database):
 # Kanalga chop etish (imzo/footer bilan)
 # ---------------------------------------------------------------------------
 
-async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id: int):
+async def publish_post_to_channel(bot: Bot, db: Database, post_id: int) -> tuple[bool, str]:
+    """
+    Postni kanalga chop etishning asosiy mantiqi. Bu funksiya callback orqali ham,
+    rejalashtirilgan postlar uchun fon vazifasi (scheduler) orqali ham chaqiriladi.
+    Natija: (muvaffaqiyatli_boldimi, xabar_matni)
+    """
     post = await db.get_post(post_id)
     if not post:
-        await callback.message.answer("⚠️ Post topilmadi.")
-        return
+        return False, "⚠️ Post topilmadi."
 
     if not CHANNEL_ID:
-        await callback.message.answer("❌ CHANNEL_ID .env faylida sozlanmagan.")
-        return
+        return False, "❌ CHANNEL_ID .env faylida sozlanmagan."
 
     final_text = f"{format_for_telegram_html(post.content)}\n\n-------------------\n{html_escape(CHANNEL_FOOTER)}"
 
     try:
-        if post.image_url and os.path.exists(post.image_url):
+        if post.attachment_file_id:
+            # .apk (yoki boshqa hujjat) — hostga yuklanmaydi, Telegram file_id orqali to'g'ridan-to'g'ri forward qilinadi
+            caption_text = final_text
+            if len(caption_text) > 1024:
+                # Telegram caption limiti 1024 belgi — sig'masa, hujjatni izohsiz yuboramiz,
+                # to'liq matnni alohida xabar sifatida qo'shamiz.
+                sent = await bot.send_document(chat_id=CHANNEL_ID, document=post.attachment_file_id)
+                await bot.send_message(chat_id=CHANNEL_ID, text=final_text, parse_mode="HTML")
+            else:
+                sent = await bot.send_document(
+                    chat_id=CHANNEL_ID,
+                    document=post.attachment_file_id,
+                    caption=caption_text,
+                    parse_mode="HTML",
+                )
+        elif post.image_url and os.path.exists(post.image_url):
             sent = await bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=FSInputFile(post.image_url),
@@ -543,16 +662,70 @@ async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id
             sent = await bot.send_message(chat_id=CHANNEL_ID, text=final_text, parse_mode="HTML")
 
         await db.mark_published(post_id, channel_message_id=sent.message_id)
+        return True, "✅ Post muvaffaqiyatli kanalga chop etildi!"
 
+    except Exception as e:
+        logger.exception("Kanalga chop etishda xatolik: %s", e)
+        return False, f"❌ Kanalga chop etishda xatolik: {e}"
+
+
+async def send_daily_draft(
+    bot: Bot,
+    db: Database,
+    admin_chat_id: int,
+    content: str,
+    source_type: str,
+    source_ref: Optional[str] = None,
+    auto_image_bytes: Optional[bytes] = None,
+    auto_image_source: ImageSourceType = ImageSourceType.NONE,
+) -> None:
+    """
+    Kunlik avtomatik generatsiya (scheduler) tomonidan chaqiriladi.
+    Admin bilan Message/CallbackQuery kontekstisiz, to'g'ridan-to'g'ri chat_id orqali ishlaydi.
+    """
+    try:
+        post = await db.create_post(content=content, source_type=source_type, source_ref=source_ref)
+    except Exception as e:
+        logger.exception("Kunlik post yaratishda xatolik: %s", e)
+        return
+
+    image_path = None
+    if auto_image_bytes:
+        try:
+            watermark_text = CHANNEL_USERNAME or "@channel"
+            final_bytes = image_service.add_text_watermark(auto_image_bytes, watermark_text)
+            tmp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+            with open(tmp_path, "wb") as f:
+                f.write(final_bytes)
+            await db.update_post_image(post.id, image_url=tmp_path, image_source=auto_image_source)
+            image_path = tmp_path
+        except Exception as e:
+            logger.warning("Kunlik post uchun rasm tayyorlashda xatolik: %s", e)
+
+    label = "📰 Kunlik yangilik" if source_type == "rss" else "🤖 Kunlik AI post"
+    caption = f"🗓 <b>{label} (tasdiqlashingizni kutmoqda):</b>\n\n{format_for_telegram_html(content)}"
+    keyboard = build_moderation_keyboard(post.id)
+
+    try:
+        if image_path:
+            sent = await bot.send_photo(
+                admin_chat_id, FSInputFile(image_path), caption=caption, parse_mode="HTML", reply_markup=keyboard
+            )
+        else:
+            sent = await bot.send_message(admin_chat_id, caption, parse_mode="HTML", reply_markup=keyboard)
+        await db.set_admin_message(post.id, sent.chat.id, sent.message_id)
+    except Exception as e:
+        logger.exception("Kunlik postni adminga yuborishda xatolik: %s", e)
+
+
+async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id: int):
+    success, info_text = await publish_post_to_channel(bot, db, post_id)
+    if success:
         try:
             await callback.message.delete()
         except Exception:
             pass
-        await callback.message.answer("✅ Post muvaffaqiyatli kanalga chop etildi!")
-
-    except Exception as e:
-        logger.exception("Kanalga chop etishda xatolik: %s", e)
-        await callback.message.answer(f"❌ Kanalga chop etishda xatolik: {e}")
+    await callback.message.answer(info_text)
 
 
 async def _publish_rich_post(callback: CallbackQuery, db: Database, bot: Bot, post_id: int):
@@ -570,7 +743,7 @@ async def _publish_rich_post(callback: CallbackQuery, db: Database, bot: Bot, po
         await callback.message.answer("❌ CHANNEL_ID .env faylida sozlanmagan.")
         return
 
-    body_markdown = build_rich_markdown(post.content)
+    body_markdown = await ai_service.enrich_content_for_rich_post(post.content)
     footer_markdown = f"---\n\n{CHANNEL_FOOTER}"
 
     media_list = None
