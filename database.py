@@ -29,6 +29,7 @@ class Base(DeclarativeBase):
 
 class PostStatus(str, enum.Enum):
     DRAFT = "draft"          # Admin chatida ko'rib chiqilmoqda
+    SCHEDULED = "scheduled"  # Kelajakdagi vaqtga rejalashtirilgan
     PUBLISHED = "published"  # Kanalga chop etilgan
     DELETED = "deleted"      # Admin tomonidan bekor qilingan
 
@@ -68,6 +69,12 @@ class Post(Base):
 
     # Kanalga chop etilgandan keyingi xabar ID (kerak bo'lsa tahrirlash uchun)
     channel_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # .apk yoki boshqa hujjat biriktirilgan bo'lsa — Telegram file_id (hostga yuklamasdan, shu ID orqali forward qilinadi)
+    attachment_file_id: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+
+    # Rejalashtirilgan chop etish vaqti (agar mavjud bo'lsa)
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -121,6 +128,7 @@ class Database:
         source_ref: Optional[str] = None,
         image_url: Optional[str] = None,
         image_source: ImageSourceType = ImageSourceType.NONE,
+        attachment_file_id: Optional[str] = None,
     ) -> Post:
         async with self.session_factory() as session:
             post = Post(
@@ -129,6 +137,7 @@ class Database:
                 source_ref=source_ref,
                 image_url=image_url,
                 image_source=image_source,
+                attachment_file_id=attachment_file_id,
                 status=PostStatus.DRAFT,
             )
             session.add(post)
@@ -218,3 +227,30 @@ class Database:
                 await session.rollback()
                 logger.exception("Postni o'chirishda xatolik: %s", e)
                 raise
+
+    async def schedule_post(self, post_id: int, scheduled_at: datetime) -> None:
+        async with self.session_factory() as session:
+            post = await session.get(Post, post_id)
+            if not post:
+                return
+            post.status = PostStatus.SCHEDULED
+            post.scheduled_at = scheduled_at
+            try:
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                logger.exception("Postni rejalashtirishda xatolik: %s", e)
+                raise
+
+    async def get_due_scheduled_posts(self, now: datetime) -> list[Post]:
+        """Vaqti kelgan (scheduled_at <= now), hali chop etilmagan postlarni qaytaradi."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Post).where(
+                    Post.status == PostStatus.SCHEDULED,
+                    Post.scheduled_at <= now,
+                )
+            )
+            return list(result.scalars().all())
