@@ -1,3 +1,12 @@
+"""
+main.py
+Telegram Channel Manager AI botini ishga tushiruvchi asosiy fayl.
+
+- Polling yoki Webhook rejimida ishlashi mumkin (RUN_MODE env orqali).
+- Render.com'da 24/7 uxlab qolmasligi uchun aiohttp orqali /health endpoint ochadi
+  (UptimeRobot shu manzilga muntazam so'rov yuborib turadi).
+"""
+
 import asyncio
 import logging
 import os
@@ -40,6 +49,8 @@ async def health_check(request: web.Request) -> web.Response:
 
 
 async def on_startup(bot: Bot, db: Database) -> None:
+    # Jadvallar allaqachon run_polling/run_webhook ichida yaratilgan bo'ladi,
+    # lekin ehtiyot uchun bu yerda ham tekshirib qo'yamiz (idempotent amal).
     await db.init_models()
     if RUN_MODE == "webhook" and WEBHOOK_URL:
         full_url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
@@ -76,6 +87,12 @@ async def run_polling() -> None:
     )
     dp = create_dispatcher(db)
 
+    # KRITIK: jadvallar polling boshlanishidan OLDIN, aniq va kutilgan holda yaratiladi.
+    # dp.startup hodisasiga tayanmaymiz, chunki ba'zi muhitlarda uning tugashi
+    # kafolatlanmasligi mumkin va bu "no such table" xatosiga olib kelishi mumkin.
+    await db.init_models()
+    logger.info("Ma'lumotlar bazasi jadvallari tayyor (init_models bajarildi).")
+
     # Render.com'da web-service sifatida ishlasa ham port ochiq turishi kerak,
     # shuning uchun polling rejimida ham yengil health-server ko'taramiz.
     app = web.Application()
@@ -99,6 +116,10 @@ async def run_webhook() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = create_dispatcher(db)
+
+    # KRITIK: jadvallar server ishga tushishidan OLDIN aniq yaratiladi (xuddi polling rejimida kabi).
+    await db.init_models()
+    logger.info("Ma'lumotlar bazasi jadvallari tayyor (init_models bajarildi).")
 
     app = web.Application()
     app.router.add_get("/health", health_check)
