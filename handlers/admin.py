@@ -8,10 +8,11 @@ import logging
 import os
 import re
 import tempfile
+from html import escape as html_escape
 from typing import Optional
 
 from aiogram import Router, F, Bot
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -20,6 +21,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
+    InputMediaPhoto,
+    InputRichMessage,
+    InputRichMessageMedia,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -50,6 +54,21 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def format_for_telegram_html(text: str) -> str:
+    """
+    AI tomonidan yaratilgan matnni Telegram HTML rejimi uchun xavfsiz formatlaydi.
+    - Avval xavfli HTML belgilarini escape qiladi (<, >, &).
+    - Keyin Markdown uslubidagi **qalin** belgilarni <b>qalin</b> ga aylantiradi.
+    - Qolgan yakka yulduzcha/pastki chiziqlarni (agar AI baribir qoldirib ketsa) tozalaydi.
+    """
+    escaped = html_escape(text, quote=False)
+    # **qalin matn** -> <b>qalin matn</b>
+    bolded = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+    # Qolgan yakka yulduzcha yoki pastki chiziqlarni olib tashlaymiz
+    cleaned = bolded.replace("**", "").replace("__", "")
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # FSM holatlari
 # ---------------------------------------------------------------------------
@@ -74,13 +93,33 @@ def build_image_choice_keyboard(post_id: int) -> InlineKeyboardMarkup:
 def build_moderation_keyboard(post_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Kanalga e'lon qilish", callback_data=f"post:publish:{post_id}")
+    builder.button(text="📰 Maqola sifatida", callback_data=f"post:richpost:{post_id}")
     builder.button(text="🔄 Qayta yozish", callback_data=f"post:rewrite:{post_id}")
     builder.button(text="🖼 AI Rasm", callback_data=f"post:ai_image:{post_id}")
     builder.button(text="🔍 Google Rasm", callback_data=f"post:real_image:{post_id}")
     builder.button(text="✏️ Tahrirlash", callback_data=f"post:edit:{post_id}")
     builder.button(text="🗑 O'chirish", callback_data=f"post:delete:{post_id}")
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
+
+
+def build_rich_markdown(content: str) -> str:
+    """
+    Oddiy post matnini Telegram Rich Message (Bot API 10.1+) uchun
+    "maqola"ga o'xshash strukturaga aylantiradi: sarlavha + paragraflar + ajratgich.
+    """
+    lines = [line.strip() for line in content.split("\n") if line.strip()]
+    if not lines:
+        return content
+
+    heading = lines[0]
+    body_lines = lines[1:]
+    body = "\n\n".join(body_lines) if body_lines else ""
+
+    md = f"## {heading}"
+    if body:
+        md += f"\n\n{body}"
+    return md
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +163,7 @@ async def _start_post_flow(
         return
 
     sent = await message.answer(
-        f"📝 <b>Qoralama tayyor:</b>\n\n{content}\n\n"
+        f"📝 <b>Qoralama tayyor:</b>\n\n{format_for_telegram_html(content)}\n\n"
         f"Rasm bilan bog'liq variantni tanlang:",
         parse_mode="HTML",
         reply_markup=build_image_choice_keyboard(post.id),
@@ -158,28 +197,42 @@ async def cmd_post_topic(message: Message, command: CommandObject, db: Database)
 
 
 # ---------------------------------------------------------------------------
-# 2) Link yuborilganda avtomatik tahlil
+# 2) Oddiy matn xabari: link bo'lsa — tahlil qiladi, aks holda mavzu sifatida post yaratadi
 # ---------------------------------------------------------------------------
 
-@router.message(F.text.regexp(URL_REGEX.pattern))
-async def handle_link_message(message: Message, db: Database):
+@router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def handle_text_message(message: Message, db: Database):
     if not is_admin(message.from_user.id):
         return
 
-    match = URL_REGEX.search(message.text)
-    if not match:
+    text = message.text.strip()
+    if not text:
         return
-    url = match.group(0)
 
-    status_msg = await message.answer("🔗 Havola o'qilmoqda va qayta yozilmoqda...")
+    match = URL_REGEX.search(text)
+
+    if match:
+        url = match.group(0)
+        status_msg = await message.answer("🔗 Havola o'qilmoqda va qayta yozilmoqda...")
+        try:
+            content = await ai_service.fetch_and_summarize_link(url)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Havolani qayta ishlashda xatolik: {e}")
+            return
+        await status_msg.delete()
+        await _start_post_flow(message, db, content, source_type="link", source_ref=url)
+        return
+
+    # URL topilmadi — matnni mavzu sifatida qabul qilib, post yaratamiz
+    status_msg = await message.answer("🤖 AI post tayyorlamoqda, kuting...")
     try:
-        content = await ai_service.fetch_and_summarize_link(url)
+        content = await ai_service.generate_post_from_topic(text)
     except Exception as e:
-        await status_msg.edit_text(f"❌ Havolani qayta ishlashda xatolik: {e}")
+        await status_msg.edit_text(f"❌ Post yaratishda xatolik: {e}")
         return
 
     await status_msg.delete()
-    await _start_post_flow(message, db, content, source_type="link", source_ref=url)
+    await _start_post_flow(message, db, content, source_type="topic", source_ref=text)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +318,8 @@ async def handle_image_choice(callback: CallbackQuery, db: Database):
     prompt_seed = post.source_ref or post.content[:200]
 
     await callback.message.edit_text(
-        f"{post.content}\n\n⏳ Rasm tayyorlanmoqda, biroz kuting...",
+        f"{format_for_telegram_html(post.content)}\n\n⏳ Rasm tayyorlanmoqda, biroz kuting...",
+        parse_mode="HTML",
     )
 
     try:
@@ -295,7 +349,8 @@ async def handle_image_choice(callback: CallbackQuery, db: Database):
     except Exception as e:
         logger.exception("Rasm tayyorlashda xatolik: %s", e)
         await callback.message.edit_text(
-            f"{post.content}\n\n⚠️ Rasm tayyorlashda xatolik yuz berdi: {e}\nRasmsiz davom etamiz.",
+            f"{format_for_telegram_html(post.content)}\n\n⚠️ Rasm tayyorlashda xatolik yuz berdi: {html_escape(str(e))}\nRasmsiz davom etamiz.",
+            parse_mode="HTML",
         )
         await _render_moderation_panel(callback.message, db, post_id)
 
@@ -307,7 +362,7 @@ async def _render_moderation_panel(
     if not post:
         return
 
-    caption = f"📝 <b>Moderatsiya:</b>\n\n{post.content}"
+    caption = f"📝 <b>Moderatsiya:</b>\n\n{format_for_telegram_html(post.content)}"
     keyboard = build_moderation_keyboard(post_id)
 
     photo_to_use = photo_path or (post.image_url if post.image_url and os.path.exists(post.image_url) else None)
@@ -344,6 +399,10 @@ async def handle_moderation_action(callback: CallbackQuery, db: Database, bot: B
     if action == "publish":
         await callback.answer("📢 Kanalga chop etilmoqda...")
         await _publish_post(callback, db, bot, post_id)
+
+    elif action == "richpost":
+        await callback.answer("📰 Maqola sifatida chop etilmoqda...")
+        await _publish_rich_post(callback, db, bot, post_id)
 
     elif action == "rewrite":
         await callback.answer("🔄 Qayta yozilmoqda...")
@@ -470,7 +529,7 @@ async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id
         await callback.message.answer("❌ CHANNEL_ID .env faylida sozlanmagan.")
         return
 
-    final_text = f"{post.content}\n\n-------------------\n{CHANNEL_FOOTER}"
+    final_text = f"{format_for_telegram_html(post.content)}\n\n-------------------\n{html_escape(CHANNEL_FOOTER)}"
 
     try:
         if post.image_url and os.path.exists(post.image_url):
@@ -478,9 +537,10 @@ async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id
                 chat_id=CHANNEL_ID,
                 photo=FSInputFile(post.image_url),
                 caption=final_text,
+                parse_mode="HTML",
             )
         else:
-            sent = await bot.send_message(chat_id=CHANNEL_ID, text=final_text)
+            sent = await bot.send_message(chat_id=CHANNEL_ID, text=final_text, parse_mode="HTML")
 
         await db.mark_published(post_id, channel_message_id=sent.message_id)
 
@@ -493,3 +553,61 @@ async def _publish_post(callback: CallbackQuery, db: Database, bot: Bot, post_id
     except Exception as e:
         logger.exception("Kanalga chop etishda xatolik: %s", e)
         await callback.message.answer(f"❌ Kanalga chop etishda xatolik: {e}")
+
+
+async def _publish_rich_post(callback: CallbackQuery, db: Database, bot: Bot, post_id: int):
+    """
+    Postni Telegram Rich Message (Bot API 10.1+, 'Maqola' uslubi) sifatida
+    kanalga chop etadi — sarlavha, paragraflar va ajratgichlar bilan.
+    Bu funksiya aiogram>=3.31 talab qiladi.
+    """
+    post = await db.get_post(post_id)
+    if not post:
+        await callback.message.answer("⚠️ Post topilmadi.")
+        return
+
+    if not CHANNEL_ID:
+        await callback.message.answer("❌ CHANNEL_ID .env faylida sozlanmagan.")
+        return
+
+    body_markdown = build_rich_markdown(post.content)
+    footer_markdown = f"---\n\n{CHANNEL_FOOTER}"
+
+    media_list = None
+    if post.image_url and os.path.exists(post.image_url):
+        # Rasmni maqola boshiga tg://photo?id=... havolasi orqali bog'laymiz
+        image_markdown = "![](tg://photo?id=cover)\n\n"
+        full_markdown = f"{image_markdown}{body_markdown}\n\n{footer_markdown}"
+        media_list = [
+            InputRichMessageMedia(
+                id="cover",
+                media=InputMediaPhoto(media=FSInputFile(post.image_url)),
+            )
+        ]
+    else:
+        full_markdown = f"{body_markdown}\n\n{footer_markdown}"
+
+    try:
+        rich_message = InputRichMessage(markdown=full_markdown, media=media_list)
+        sent = await bot.send_rich_message(chat_id=CHANNEL_ID, rich_message=rich_message)
+
+        await db.mark_published(post_id, channel_message_id=sent.message_id)
+
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer("✅ Post 'Maqola' (Rich Message) sifatida kanalga chop etildi!")
+
+    except AttributeError:
+        await callback.message.answer(
+            "❌ Joriy aiogram versiyasi Rich Message'ni qo'llab-quvvatlamaydi. "
+            "requirements.txt faylida aiogram>=3.31.0 ekanini tekshiring va qaytadan deploy qiling."
+        )
+    except Exception as e:
+        logger.exception("Rich Message sifatida chop etishda xatolik: %s", e)
+        await callback.message.answer(
+            f"❌ Maqola sifatida chop etishda xatolik: {e}\n\n"
+            f"Oddiy '✅ Kanalga e'lon qilish' tugmasi orqali urinib ko'ring."
+        )
+
