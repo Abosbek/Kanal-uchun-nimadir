@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -46,6 +47,34 @@ if not BOT_TOKEN:
 async def health_check(request: web.Request) -> web.Response:
     """UptimeRobot va Render uchun oddiy health-check endpoint."""
     return web.json_response({"status": "ok", "service": "telegram-channel-manager-bot"})
+
+
+async def self_ping_loop() -> None:
+    """
+    Botni Render'ning bepul tarifida 24/7 uyg'oq ushlab turish uchun,
+    bot o'zining ochiq /health manzilini har necha daqiqada bir marta
+    o'zi so'raydi. Bu UptimeRobot kabi tashqi xizmatga qo'shimcha,
+    ikkinchi ("zaxira") mudofaa qatlami sifatida ishlaydi.
+
+    Render web-service uchun avtomatik RENDER_EXTERNAL_URL muhit
+    o'zgaruvchisini beradi — shuning uchun qo'shimcha sozlash shart emas.
+    """
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not external_url:
+        logger.info("RENDER_EXTERNAL_URL topilmadi, self-ping o'chirilgan (masalan lokal ishga tushirishda normal holat).")
+        return
+
+    ping_url = f"{external_url}/health"
+    interval_seconds = int(os.getenv("SELF_PING_INTERVAL_SECONDS", "600"))  # standart: 10 daqiqa
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                async with session.get(ping_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    logger.info("Self-ping yuborildi (%s) -> status %s", ping_url, resp.status)
+            except Exception as e:
+                logger.warning("Self-ping muvaffaqiyatsiz bo'ldi: %s", e)
 
 
 async def on_startup(bot: Bot, db: Database) -> None:
@@ -103,6 +132,9 @@ async def run_polling() -> None:
     await site.start()
     logger.info("Health-check server %s portda ishga tushdi.", PORT)
 
+    # Fon rejimida self-ping vazifasini ishga tushiramiz (Render bepul tarifida uxlab qolmaslik uchun)
+    asyncio.create_task(self_ping_loop())
+
     try:
         await dp.start_polling(bot)
     finally:
@@ -133,6 +165,9 @@ async def run_webhook() -> None:
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     logger.info("Webhook server %s portda ishga tushdi (yo'l: %s).", PORT, WEBHOOK_PATH)
+
+    # Fon rejimida self-ping vazifasini ishga tushiramiz (Render bepul tarifida uxlab qolmaslik uchun)
+    asyncio.create_task(self_ping_loop())
 
     # Server abadiy ishlab tursin
     await asyncio.Event().wait()
