@@ -41,6 +41,7 @@ BASE_STYLE_PROMPT = (
     "Uslubing:batafsil jonli, chiroyli emoji bilan bezatilgan ammo juda ko‘p emoji han bo‘lmasin, aniq va professional. "
     "Post oxirida mavzuga mos 3-5 ta hashteg qo'sh. "
     "Telegram post imkoniyatlar foydalib matnning muhim joylarini qalin oddiy joylarini qiya yoki iqtibosli qilib chiroyli post qil. "
+    "So‘z boshi oxiriga yulduzchlar, har xil boshqa belgilar qo‘yma" 
     "# sarlavha yoki shunga o'xshash belgilarni ishlatma. Faqat oddiy matn va emoji ishlat. "
     "Faqat tayyor post matnini qaytar, hech qanday qo'shimcha izoh yozma."
 )
